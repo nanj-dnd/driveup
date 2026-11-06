@@ -460,6 +460,32 @@ def cmd_clear(args):
     print(f"Forgot {before - len(state['files'])} finished upload(s). Files in Drive are untouched.")
 
 
+# macOS "Open" window that takes files and folders together, run through osascript.
+PICKER = """
+ObjC.import("AppKit");
+$.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
+const panel = $.NSOpenPanel.openPanel;
+panel.canChooseFiles = true;
+panel.canChooseDirectories = true;
+panel.allowsMultipleSelection = true;
+panel.message = "Choose files or folders to upload to Google Drive";
+panel.prompt = "Upload";
+panel.runModal == $.NSModalResponseOK ? panel.URLs.js.map((u) => u.path.js).join("\\n") : "";
+"""
+
+
+def cmd_pick(args):
+    if sys.platform != "darwin":
+        sys.exit('Picking files needs a Mac. Instead run: driveup add <file or folder> --to "Folder"')
+    print("Choose what to upload in the window that just opened...")
+    out = subprocess.run(["osascript", "-l", "JavaScript", "-e", PICKER], capture_output=True, text=True)
+    args.paths = [p for p in out.stdout.splitlines() if p]
+    if not args.paths:
+        sys.exit("Nothing chosen.")
+    args.no_start = False
+    cmd_add(args)
+
+
 def cmd_login(args):
     session()
     print("Signed in. driveup can upload now.")
@@ -467,7 +493,10 @@ def cmd_login(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="driveup", description="Resumable Google Drive uploads.")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    k = sub.add_parser("pick", help="choose files/folders in a window and upload them (same as plain `driveup`)")
+    k.add_argument("--to", default="driveup", help='Drive folder path (default: driveup)')
+    k.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
     a = sub.add_parser("add", help="queue files/folders and start uploading")
     a.add_argument("paths", nargs="+")
     a.add_argument("--to", default="driveup", help='Drive folder path, e.g. "Backups/2026" (default: driveup)')
@@ -478,8 +507,10 @@ def main():
     sub.add_parser("clear", help="forget finished uploads")
     sub.add_parser("login", help="sign in to Google")
     args = ap.parse_args()
+    if not args.cmd:  # plain `driveup` opens the file picker
+        args = ap.parse_args(["pick"])
     try:
-        {"add": cmd_add, "run": cmd_run, "status": cmd_status, "clear": cmd_clear, "login": cmd_login}[args.cmd](args)
+        {"pick": cmd_pick, "add": cmd_add, "run": cmd_run, "status": cmd_status, "clear": cmd_clear, "login": cmd_login}[args.cmd](args)
     except KeyboardInterrupt:
         print("\n\nPaused. Progress is saved. Continue anytime with: driveup run")
 

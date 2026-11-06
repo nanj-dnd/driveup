@@ -13,7 +13,9 @@ Needs Python 3 (on a Mac: `xcode-select --install`). Or with pipx: `pipx install
 ## Use
 
 ```sh
-driveup add ~/Movies/big-folder --to "Backups/Movies"   # queue and start uploading
+driveup                                                 # pick files or folders in a window, then upload
+driveup pick --to "Backups/2026"                         # same, into a chosen Drive folder
+driveup add ~/Movies/big-folder --to "Backups/Movies"   # or name them yourself
 driveup status                                          # what's done, partial, not started
 driveup run                                             # continue anything unfinished
 driveup clear                                           # forget finished uploads

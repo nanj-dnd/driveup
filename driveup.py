@@ -41,6 +41,20 @@ SKIP = {".DS_Store", "Thumbs.db", "desktop.ini"}
 FINISHED = {"verified", "mismatch"}
 NET_ERRORS = (requests.ConnectionError, requests.Timeout, TransportError)
 
+# driveup's own Google sign-in, shared by everyone who installs it. Google treats
+# a desktop app's client secret as not confidential: it can't be kept secret in
+# software people run on their own computers, and it only identifies the app.
+# A credentials.json in ~/.driveup overrides this.
+CLIENT_CONFIG = {
+    "installed": {
+        "client_id": "",
+        "client_secret": "",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }
+}
+
 SETUP_HELP = f"""\
 driveup needs a Google OAuth client before its first upload (one-time, ~5 minutes):
 
@@ -121,11 +135,15 @@ def session():
                 line("No internet connection, retrying in 10s")
                 time.sleep(10)
     if not creds or not creds.valid:
-        if not CLIENT.exists():
-            sys.exit(SETUP_HELP)
         from google_auth_oauthlib.flow import InstalledAppFlow
+        if CLIENT.exists():
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT), SCOPES)
+        elif CLIENT_CONFIG["installed"]["client_id"]:
+            flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, SCOPES)
+        else:
+            sys.exit(SETUP_HELP)
         print("Opening your browser to sign in to Google...")
-        creds = InstalledAppFlow.from_client_secrets_file(str(CLIENT), SCOPES).run_local_server(port=0)
+        creds = flow.run_local_server(port=0)
     HOME.mkdir(parents=True, exist_ok=True)
     TOKEN.write_text(creds.to_json())
     os.chmod(TOKEN, 0o600)

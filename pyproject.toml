@@ -1,0 +1,17 @@
+[project]
+name = "driveup"
+version = "1.0.0"
+description = "Big Google Drive uploads that survive sleep, wifi drops and restarts."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["google-auth-oauthlib>=1.2", "requests"]
+
+[project.scripts]
+driveup = "driveup:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["driveup"]

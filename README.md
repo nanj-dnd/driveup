@@ -1,18 +1,28 @@
 # Driveup
 
-Upload big files to Google Drive without babysitting them. Uploads survive sleep, lid-close, wifi drops and browser restarts, and every finished file is checked against Drive's MD5.
+Upload big files to Google Drive from the terminal without babysitting them. Uploads survive sleep, lid-close, wifi drops and restarts, and every finished file is checked against Drive's MD5.
 
-**Use it:** https://nanj-dnd.github.io/driveup/ (Chrome, Edge or Arc). Nothing to install.
+## Install
 
-- **`web/`** is the website. It's plain HTML and JavaScript with no build step, deployed to GitHub Pages on every push to `main`. Hosting your own copy is covered in [`web/SETUP.md`](web/SETUP.md).
-- **`driveup.py`** is the same idea as a command-line tool:
+```sh
+curl -fsSL https://raw.githubusercontent.com/nanj-dnd/driveup/main/install.sh | sh
+```
 
-  ```sh
-  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-  ./driveup add ~/Movies/big-folder --to "Backups/Movies"
-  ./driveup status
-  ```
+Needs Python 3 (on a Mac: `xcode-select --install`). Or with pipx: `pipx install git+https://github.com/nanj-dnd/driveup.git`.
 
-  It needs an OAuth client of type *Desktop app*, saved as `~/.driveup/credentials.json`.
+## Use
 
-Driveup only asks for the `drive.file` scope, so it can see the files it uploaded and nothing else in your Drive. Files go straight from your browser to Google; there's no Driveup server.
+```sh
+driveup add ~/Movies/big-folder --to "Backups/Movies"   # queue and start uploading
+driveup status                                          # what's done, partial, not started
+driveup run                                             # continue anything unfinished
+driveup clear                                           # forget finished uploads
+```
+
+The first run opens your browser once to sign in to Google. If it's interrupted (Ctrl-C, sleep, wifi, reboot), run `driveup run` and it continues from the last piece Drive received.
+
+Driveup only asks for the `drive.file` scope, so it can see the files it uploaded and nothing else in your Drive. Files go straight from your computer to Google.
+
+## Also
+
+[`web/`](web/) is the same uploader as a website, at https://nanj-dnd.github.io/driveup/.

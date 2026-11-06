@@ -460,25 +460,31 @@ def cmd_clear(args):
     print(f"Forgot {before - len(state['files'])} finished upload(s). Files in Drive are untouched.")
 
 
-# macOS "Open" window that takes files and folders together, run through osascript.
+# The standard macOS chooser (sidebar, Desktop, iCloud...), run through osascript.
+# It picks files or folders, not both at once, so it asks which first.
 PICKER = """
-ObjC.import("AppKit");
-$.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
-const panel = $.NSOpenPanel.openPanel;
-panel.canChooseFiles = true;
-panel.canChooseDirectories = true;
-panel.allowsMultipleSelection = true;
-panel.message = "Choose files or folders to upload to Google Drive";
-panel.prompt = "Upload";
-panel.runModal == $.NSModalResponseOK ? panel.URLs.js.map((u) => u.path.js).join("\\n") : "";
+set kind to button returned of (display dialog "Upload files or folders to Google Drive?" ¬
+  buttons {"Cancel", "Folders", "Files"} default button "Files" cancel button "Cancel" with title "driveup")
+if kind is "Files" then
+  set picked to choose file with prompt "Choose files to upload" default location (path to desktop) ¬
+    with multiple selections allowed
+else
+  set picked to choose folder with prompt "Choose folders to upload" default location (path to desktop) ¬
+    with multiple selections allowed
+end if
+set out to ""
+repeat with f in picked
+  set out to out & POSIX path of f & linefeed
+end repeat
+return out
 """
 
 
 def cmd_pick(args):
     if sys.platform != "darwin":
         sys.exit('Picking files needs a Mac. Instead run: driveup add <file or folder> --to "Folder"')
-    print("Choose what to upload in the window that just opened...")
-    out = subprocess.run(["osascript", "-l", "JavaScript", "-e", PICKER], capture_output=True, text=True)
+    print("Choose what to upload in the window that just opened (check the Dock if you don't see it)...")
+    out = subprocess.run(["osascript", "-e", PICKER], capture_output=True, text=True)
     args.paths = [p for p in out.stdout.splitlines() if p]
     if not args.paths:
         sys.exit("Nothing chosen.")

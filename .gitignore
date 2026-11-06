@@ -1,0 +1,6 @@
+# Private signing key: keeps the extension ID stable. Never commit.
+*.pem
+.venv/
+Driveup.zip
+.DS_Store
+__pycache__/

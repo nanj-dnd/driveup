@@ -22,7 +22,3 @@ driveup clear                                           # forget finished upload
 The first run opens your browser once to sign in to Google. If it's interrupted (Ctrl-C, sleep, wifi, reboot), run `driveup run` and it continues from the last piece Drive received.
 
 Driveup only asks for the `drive.file` scope, so it can see the files it uploaded and nothing else in your Drive. Files go straight from your computer to Google.
-
-## Also
-
-[`web/`](web/) is the same uploader as a website, at https://nanj-dnd.github.io/driveup/.

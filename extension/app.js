@@ -218,6 +218,9 @@ async function run() {
   refreshSpace();
 
   const signal = state.controller.signal;
+  // Holding a lock tells Chrome this tab is busy, so it doesn't freeze it in the background.
+  let unlock;
+  navigator.locks?.request("driveup-uploading", () => new Promise((r) => (unlock = r)));
   const worker = async () => {
     let job;
     while (!signal.aborted && (job = nextJob())) {
@@ -232,6 +235,7 @@ async function run() {
     state.running = false;
     state.note = "";
     chrome.power?.releaseKeepAwake();
+    unlock?.();
     render();
   }
 
@@ -498,8 +502,16 @@ function drawFolders() {
 
 let frame;
 function render() {
+  title();
   if (frame) return;
   frame = requestAnimationFrame(() => { frame = null; draw(); });
+}
+
+// Chrome doesn't paint hidden tabs, so the tab title carries progress while you're elsewhere.
+function title() {
+  const total = state.jobs.reduce((n, j) => n + j.size, 0);
+  const sent = state.jobs.reduce((n, j) => n + (j.status === "done" ? j.size : j.sent || 0), 0);
+  document.title = state.running && total ? `${Math.floor((sent * 100) / total)}% · Driveup` : "Driveup";
 }
 
 function draw() {
@@ -649,6 +661,7 @@ function wire() {
     Promise.all(items).then((hs) => addHandles(hs.filter(Boolean)));
   });
 
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
   addEventListener("beforeunload", (e) => { if (state.running) e.preventDefault(); });
   chrome.notifications?.onClicked.addListener(async (id) => {
     const tab = await chrome.tabs.getCurrent();

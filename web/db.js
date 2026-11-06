@@ -1,5 +1,5 @@
-// IndexedDB storage. Jobs live here (not chrome.storage) because they hold file
-// handles, which is what lets an upload resume after Chrome restarts.
+// IndexedDB storage. Jobs live here (not localStorage) because they hold file
+// handles, which is what lets an upload resume after the browser restarts.
 let opened;
 
 function open() {

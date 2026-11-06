@@ -6,6 +6,8 @@
   <title>Driveup</title>
   <link rel="icon" href="icons/32.png">
   <link rel="stylesheet" href="app.css">
+  <meta name="description" content="Upload big files to Google Drive. Keeps going through sleep, wifi drops and restarts, and shows exactly what made it.">
+  <script src="https://accounts.google.com/gsi/client" async></script>
   <script type="module" src="app.js"></script>
 </head>
 <body>
@@ -18,32 +20,36 @@
   </header>
 
   <main>
-    <!-- No client ID configured yet: shown to whoever is setting the extension up. -->
+    <!-- No client ID configured yet: shown to whoever is hosting their own copy. -->
     <section class="screen" id="setup" hidden>
       <h1>One-time setup</h1>
-      <p class="lede">Driveup needs its own Google sign-in before anyone can use it. You do this once. Everyone you share the extension with skips it.</p>
+      <p class="lede">Your copy of Driveup needs its own Google sign-in before anyone can use it. You do this once. Everyone who uses your site skips it.</p>
       <ol class="steps">
         <li>Open <a href="https://console.cloud.google.com/projectcreate" target="_blank">Google Cloud</a> and create a project (any name).</li>
         <li>Turn on the <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank">Google Drive API</a> for it.</li>
         <li>Under <a href="https://console.cloud.google.com/auth/branding" target="_blank">Google Auth Platform</a>, set up the app: name it Driveup, choose <b>External</b>, and add your email.</li>
-        <li>Under <b>Clients</b>, create an OAuth client. Pick <b>Web application</b> and add this as an authorized redirect URI:
+        <li>Under <b>Clients</b>, create an OAuth client. Pick <b>Web application</b> and add this under <b>Authorised JavaScript origins</b>:
           <div class="copy"><code id="redirect"></code><button id="copy-redirect">Copy</button></div>
         </li>
         <li>Under <b>Audience</b>, press <b>Publish app</b> so anyone can sign in (Driveup only asks for access to files it uploads, so Google doesn't need to review it).</li>
-        <li>Paste the client ID into <code>config.js</code> in the extension folder, then reload the extension at <code>chrome://extensions</code>.</li>
+        <li>Paste the client ID into <code>web/config.js</code>, publish the site again, and reload this page.</li>
       </ol>
     </section>
 
     <section class="screen" id="elsewhere" hidden>
       <h1>Driveup is already open in another tab.</h1>
-      <p class="lede">Uploads run from that tab, so you don't get the same file uploaded twice.</p>
-      <button class="primary big" id="switch">Switch to it</button>
+      <p class="lede">Uploads run from that tab, so you don't get the same file uploaded twice. Close this one and switch to it.</p>
+    </section>
+
+    <section class="screen" id="unsupported" hidden>
+      <h1>Driveup needs Chrome or Edge.</h1>
+      <p class="lede">It reads your files in a way that lets uploads continue after a restart, and only Chrome, Edge and other Chromium browsers (like Arc) allow that. Open this page in one of those.</p>
     </section>
 
     <section class="screen" id="welcome" hidden>
       <h1>Upload big files to Google Drive without watching over them.</h1>
       <ul class="points">
-        <li><b>Close the lid, lose wifi, restart Chrome.</b> Driveup continues from the last piece Drive received instead of starting over.</li>
+        <li><b>Close the lid, lose wifi, restart your browser.</b> Driveup continues from the last piece Drive received instead of starting over.</li>
         <li><b>Know what made it.</b> Every file is checked against Drive's copy, so a ✓ means the copies match.</li>
         <li><b>Folders keep their shape.</b> Subfolders are recreated in Drive.</li>
       </ul>

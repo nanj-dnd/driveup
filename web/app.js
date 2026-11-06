@@ -71,8 +71,22 @@ function toast(msg) {
 }
 
 function notify(title, message) {
-  if (!state.settings.notify || !document.hidden) return;
-  chrome.notifications?.create({ type: "basic", iconUrl: "icons/128.png", title, message });
+  if (!state.settings.notify || !document.hidden || globalThis.Notification?.permission !== "granted") return;
+  const n = new Notification(title, { body: message, icon: "icons/128.png" });
+  n.onclick = () => { focus(); n.close(); };
+}
+
+// Ask from a click, the first time it matters.
+const askToNotify = () => {
+  if (state.settings.notify && globalThis.Notification?.permission === "default") Notification.requestPermission();
+};
+
+// Keeps the screen (and so the computer) awake while uploading. Browsers drop it
+// when the tab is hidden, so it's taken again whenever the tab comes back.
+let wake;
+async function stayAwake() {
+  if (!state.running || document.hidden || wake) return;
+  try { wake = await navigator.wakeLock.request("screen"); wake.onrelease = () => (wake = null); } catch {}
 }
 
 // ---------- persistence ----------
@@ -213,7 +227,7 @@ async function run() {
   state.needsSignIn = false;
   state.quota = null;
   state.controller = new AbortController();
-  chrome.power?.requestKeepAwake("system"); // like caffeinate: no idle sleep while uploading
+  stayAwake();
   render();
   refreshSpace();
 
@@ -234,7 +248,7 @@ async function run() {
   } finally {
     state.running = false;
     state.note = "";
-    chrome.power?.releaseKeepAwake();
+    wake?.release();
     unlock?.();
     render();
   }
@@ -254,7 +268,7 @@ async function run() {
 function announce() {
   if (state.quota) return notify("Driveup paused", quotaText(state.quota));
   if (state.needsSignIn) return notify("Driveup paused", "Sign in again to keep uploading.");
-  if (state.blocked.size) return notify("Driveup paused", "Chrome needs your OK to keep reading your files.");
+  if (state.blocked.size) return notify("Driveup paused", "Your browser needs your OK to keep reading your files.");
   const problems = state.jobs.filter((j) => PROBLEM.has(j.status)).length;
   const done = state.jobs.filter((j) => j.status === "done").length;
   if (problems) notify("Uploads finished, with problems", `${plural(done, "file")} uploaded. ${problems} need${problems === 1 ? "s" : ""} attention.`);
@@ -526,7 +540,7 @@ function draw() {
   const banner = $("#banner"), action = $("#banner-action"), extra = $("#banner-link");
   extra.hidden = true;
   if (state.needsSignIn) {
-    $("#banner-text").textContent = "Google needs you to sign in again before uploads can continue.";
+    $("#banner-text").textContent = "Google needs you to sign in again before uploads can continue. To skip this next time, allow pop-ups for this site (the icon at the right of the address bar).";
     action.textContent = "Sign in";
     action.onclick = doSignIn;
   } else if (state.quota) {
@@ -539,7 +553,7 @@ function draw() {
       extra.textContent = "See what's using space";
     }
   } else if (state.blocked.size) {
-    $("#banner-text").textContent = `Chrome restarted, so it needs your OK to read ${state.blocked.size === 1 ? "this file" : `these ${state.blocked.size} files`} again.`;
+    $("#banner-text").textContent = `Your browser restarted, so it needs your OK to read ${state.blocked.size === 1 ? "this file" : `these ${state.blocked.size} files`} again.`;
     action.textContent = "Resume uploads";
     action.onclick = async () => { await regrant(); run(); };
   }
@@ -629,6 +643,7 @@ async function saveSettings() {
     notify: $("#notify").checked,
   };
   await db.set("settings", state.settings);
+  askToNotify();
   render();
 }
 
@@ -642,8 +657,8 @@ function wire() {
     state.email = null;
     render();
   };
-  $("#pick-files").onclick = () => pick("files");
-  $("#pick-folder").onclick = () => pick("folder");
+  $("#pick-files").onclick = () => { askToNotify(); pick("files"); };
+  $("#pick-folder").onclick = () => { askToNotify(); pick("folder"); };
   $("#clear").onclick = clearFinished;
   $("#report").onclick = downloadReport;
   $("#dest").onchange = (e) => db.set("dest", (e.target.value = cleanPath(e.target.value)));
@@ -661,42 +676,38 @@ function wire() {
     Promise.all(items).then((hs) => addHandles(hs.filter(Boolean)));
   });
 
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { render(); stayAwake(); } });
   addEventListener("beforeunload", (e) => { if (state.running) e.preventDefault(); });
-  chrome.notifications?.onClicked.addListener(async (id) => {
-    const tab = await chrome.tabs.getCurrent();
-    chrome.tabs.update(tab.id, { active: true });
-    chrome.windows.update(tab.windowId, { focused: true });
-    chrome.notifications.clear(id);
-  });
 }
 
 async function init() {
   if (!CLIENT_ID) {
     $("#setup").hidden = false;
-    $("#redirect").textContent = chrome.identity.getRedirectURL();
+    $("#redirect").textContent = location.origin;
     $("#copy-redirect").onclick = async () => {
-      await navigator.clipboard.writeText(chrome.identity.getRedirectURL());
+      await navigator.clipboard.writeText(location.origin);
       toast("Copied.");
     };
     return;
   }
-  // Only one Driveup tab may upload; a second one just points at the first.
-  const me = await chrome.tabs?.getCurrent();
-  const tabs = (await chrome.runtime?.getContexts?.({ contextTypes: ["TAB"], documentUrls: [chrome.runtime.getURL("app.html")] })) || [];
-  const other = tabs.find((t) => t.tabId !== me?.id);
-  if (other) {
+  // Picking files and resuming after a restart need the File System Access API.
+  if (!globalThis.showOpenFilePicker) {
+    $("#unsupported").hidden = false;
+    return;
+  }
+  // Only one Driveup tab may upload, so the same file isn't uploaded twice.
+  // The first tab holds this lock for as long as it's open.
+  const first = await new Promise((resolve) => {
+    navigator.locks.request("driveup-tab", { ifAvailable: true }, (lock) => {
+      resolve(!!lock);
+      return lock && new Promise(() => {});
+    });
+  });
+  if (!first) {
     $("#elsewhere").hidden = false;
-    $("#switch").onclick = async () => {
-      await chrome.tabs.update(other.tabId, { active: true });
-      await chrome.windows.update(other.windowId, { focused: true });
-      window.close();
-    };
     return;
   }
   wire();
-  // Keep Chrome's Memory Saver from unloading this tab mid-upload.
-  if (me) chrome.tabs.update(me.id, { autoDiscardable: false });
 
   state.email = await account();
   state.settings = { ...state.settings, ...(await db.get("settings")) };

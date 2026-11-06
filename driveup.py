@@ -171,7 +171,7 @@ def call(sess, method, url, **kw):
 def check(r):
     if not r.ok:
         raise UploadError(f"Drive returned {r.status_code}: {r.text[:300]}")
-    return r.json()
+    return r.json() if r.content else {}  # starting an upload replies with headers only
 
 
 def esc(name):

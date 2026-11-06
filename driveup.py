@@ -17,9 +17,13 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -33,11 +37,19 @@ LOCK = HOME / "lock"
 
 # drive.file only lets driveup see files and folders it created itself.
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-API = "https://www.googleapis.com/drive/v3/files"
-UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+BASE = os.environ.get("DRIVEUP_BASE", "https://www.googleapis.com")  # override only for testing
+API = f"{BASE}/drive/v3/files"
+UPLOAD = f"{BASE}/upload/drive/v3/files"
 FOLDER = "application/vnd.google-apps.folder"
-CHUNK = 16 * 1024 * 1024  # Drive requires multiples of 256 KB
-SKIP = {".DS_Store", "Thumbs.db", "desktop.ini"}
+CHUNK = 64 * 1024 * 1024  # bigger pieces, fewer round trips; Drive requires multiples of 256 KB
+ONE_SHOT = 5 * 1024 * 1024  # up to this size, send metadata and bytes in one request
+SMALL = CHUNK  # files that fit in one piece upload several at a time
+WORKERS = 8
+SKIP = {".DS_Store", "Thumbs.db", "desktop.ini", ".localized", "Icon\r"}
+# Drive-wide problems: no point trying the next file.
+STOPPERS = {"storageQuotaExceeded": "Your Google Drive is full.",
+            "uploadLimitExceeded": "Google's daily upload limit (about 750 GB) is reached. Run `driveup run` again tomorrow.",
+            "activeItemCreationLimitExceeded": "Drive's limit on the number of files is reached."}
 FINISHED = {"verified", "mismatch"}
 NET_ERRORS = (requests.ConnectionError, requests.Timeout, TransportError)
 
@@ -78,6 +90,10 @@ class Retryable(Exception):
     pass
 
 
+class Stop(Exception):
+    """Drive won't take more uploads right now (full, daily limit). Stops the whole run."""
+
+
 # ---------- state ----------
 
 def load():
@@ -86,11 +102,22 @@ def load():
     return {"folders": {}, "files": {}}
 
 
-def save(state):
-    HOME.mkdir(parents=True, exist_ok=True)
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    os.replace(tmp, STATE)
+LOCK_STATE = threading.RLock()  # guards writing state.json and creating folders
+_saved_at = 0.0
+
+
+def save(state, force=True):
+    """Write progress to disk. With force=False, at most every few seconds:
+    with tens of thousands of files, the state file is big."""
+    global _saved_at
+    with LOCK_STATE:
+        if not force and time.time() - _saved_at < 5:
+            return
+        HOME.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")))
+        os.replace(tmp, STATE)
+        _saved_at = time.time()
 
 
 # ---------- output ----------
@@ -103,7 +130,12 @@ def human(n):
     return f"{n:.1f} TB"
 
 
+QUIET = threading.Event()  # set while several files upload at once: no live progress line
+
+
 def line(text):
+    if QUIET.is_set():
+        return
     sys.stdout.write("\r\033[K" + text)
     sys.stdout.flush()
 
@@ -164,12 +196,15 @@ def call(sess, method, url, **kw):
         except (*NET_ERRORS, Retryable) as err:
             reason = err if isinstance(err, Retryable) else "connection lost"
             line(f"  {reason}, retrying in {delay}s...")
-            time.sleep(delay)
+            time.sleep(delay + random.random() * delay)
             delay = min(delay * 2, 60)
 
 
 def check(r):
     if not r.ok:
+        for reason, message in STOPPERS.items():
+            if reason in r.text:
+                raise Stop(message)
         raise UploadError(f"Drive returned {r.status_code}: {r.text[:300]}")
     return r.json() if r.content else {}  # starting an upload replies with headers only
 
@@ -180,6 +215,11 @@ def esc(name):
 
 def folder_id(sess, state, remote):
     """Find or create each folder along a Drive path like 'Backups/Trip'."""
+    with LOCK_STATE:
+        return _folder_id(sess, state, remote)
+
+
+def _folder_id(sess, state, remote):
     parent, path = "root", ""
     for part in [p for p in remote.split("/") if p]:
         path = f"{path}/{part}" if path else part
@@ -191,7 +231,7 @@ def folder_id(sess, state, remote):
             else:
                 meta = {"name": part, "mimeType": FOLDER, "parents": [parent]}
                 state["folders"][path] = check(call(sess, "POST", API, params={"fields": "id"}, json=meta))["id"]
-            save(state)
+            save(state, force=False)
         parent = state["folders"][path]
     return parent
 
@@ -209,7 +249,7 @@ def start_session(sess, state, e):
         check(r)
         e["session"] = r.headers["Location"]
         e["sent"] = 0
-        save(state)
+        save(state, force=e["size"] > SMALL)
         return
 
 
@@ -240,6 +280,48 @@ def md5(path):
 
 # ---------- uploading ----------
 
+def find_copy(sess, parent, name, digest):
+    """An identical file already in this Drive folder (e.g. sent just before an interruption)."""
+    q = f"name = '{esc(name)}' and '{parent}' in parents and trashed = false"
+    found = check(call(sess, "GET", API, params={"q": q, "fields": "files(id,md5Checksum)"}))["files"]
+    return next((f for f in found if f.get("md5Checksum") == digest), None)
+
+
+def one_shot(sess, state, e, path):
+    """Small files: metadata and bytes in a single request, checked against the bytes sent."""
+    data = path.read_bytes()
+    digest = hashlib.md5(data).hexdigest()
+    mime = mimetypes.guess_type(e["name"])[0] or "application/octet-stream"
+    delay = 2
+    for attempt in range(8):
+        parent = folder_id(sess, state, e["remote_dir"])
+        # Only after an interruption can it already be there; checking every file would double the requests.
+        if (e["interrupted"] or attempt) and (copy := find_copy(sess, parent, e["name"], digest)):
+            e.update(file_id=copy["id"], sent=e["size"], status="verified")
+            return
+        b = uuid.uuid4().hex
+        meta = json.dumps({"name": e["name"], "parents": [parent]})
+        body = (f"--{b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+                f"--{b}\r\nContent-Type: {mime}\r\n\r\n").encode() + data + f"\r\n--{b}--".encode()
+        try:
+            r = sess.post(UPLOAD, params={"uploadType": "multipart", "fields": "id,md5Checksum"}, data=body,
+                          headers={"Content-Type": f"multipart/related; boundary={b}"}, timeout=120)
+        except NET_ERRORS:
+            r = None  # it may or may not have arrived; the next attempt looks before sending again
+        if r is not None and r.status_code == 404 and attempt == 0:
+            with LOCK_STATE:
+                state["folders"].clear()  # a cached folder was deleted in Drive; rebuild the path
+            continue
+        if r is None or r.status_code in (429, 500, 502, 503, 504) or (r.status_code == 403 and "ateLimit" in r.text):
+            time.sleep(delay + random.random() * delay)
+            delay = min(delay * 2, 60)
+            continue
+        done = check(r)
+        e.update(file_id=done["id"], sent=e["size"], status="verified" if done.get("md5Checksum") == digest else "mismatch")
+        return
+    raise UploadError("Drive kept failing, try again later")
+
+
 def upload_file(sess, state, e):
     path = Path(e["local"])
     try:
@@ -252,6 +334,8 @@ def upload_file(sess, state, e):
         e.update(size=st.st_size, mtime=int(st.st_mtime), session=None, sent=0)
     size = e["size"]
     e["status"] = "uploading"
+    if 0 < size <= ONE_SHOT:
+        return one_shot(sess, state, e, path)
 
     if size == 0:
         meta = {"name": e["name"], "parents": [folder_id(sess, state, e["remote_dir"])]}
@@ -277,7 +361,7 @@ def upload_file(sess, state, e):
     with path.open("rb") as f:
         while done is None:
             e["sent"] = offset
-            save(state)
+            save(state, force=False)
             elapsed = time.time() - began
             rate = (offset - began_at) / elapsed if elapsed > 1 else 0
             left = f", {eta((size - offset) / rate)} left" if rate else ""
@@ -310,7 +394,7 @@ def upload_file(sess, state, e):
                 raise UploadError(f"Drive returned {r.status_code}: {r.text[:300]}")
 
     e.update(file_id=done["id"], sent=size, session=None)
-    save(state)
+    save(state, force=size > SMALL)
     remote_md5 = done.get("md5Checksum") or check(
         call(sess, "GET", f"{API}/{done['id']}", params={"fields": "md5Checksum"})).get("md5Checksum")
     line("  checking the upload against your file...")
@@ -374,27 +458,84 @@ def cmd_run(args):
     cmd_status(args)
 
 
+RESULT = {"verified": "✓", "mismatch": "✗ uploaded, but Drive's copy does not match your file. Upload it again by hand:",
+          "missing": "✗ no longer on your Mac, skipped:", "failed": "✗ failed:"}
+
+
+def report(i, n, e):
+    mark = RESULT.get(e["status"], e["status"])
+    why = f"  ({e['error']})" if e["status"] == "failed" else ""
+    print(f"[{i}/{n}] {mark} {e['remote_dir']}/{e['name']}{why}")
+
+
+def upload_one(sess, state, e):
+    try:
+        upload_file(sess, state, e)
+    except UploadError as err:
+        e.update(status="failed", error=str(err))
+
+
+def upload_many(creds, state, todo, n):
+    """Small files, several at a time: most of their time is round trips, not bytes."""
+    from google.auth.transport.requests import AuthorizedSession
+
+    local, stop = threading.local(), threading.Event()
+
+    def work(e):
+        if stop.is_set():
+            return None
+        if not hasattr(local, "sess"):
+            local.sess = AuthorizedSession(creds)  # one connection pool per thread
+        upload_one(local.sess, state, e)
+        save(state, force=False)
+        return e
+
+    QUIET.set()
+    pool = ThreadPoolExecutor(WORKERS)
+    i = 0
+    try:
+        for f in as_completed([pool.submit(work, e) for e in todo]):
+            if e := f.result():
+                i += 1
+                report(i, n, e)
+    except BaseException:
+        stop.set()  # let uploads in flight finish (seconds), start no new ones
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    finally:
+        QUIET.clear()
+        pool.shutdown(wait=True)
+    return i
+
+
 def upload_all(args):
     state = load()
     todo = [e for e in state["files"].values() if e["status"] not in FINISHED]
     if not todo:
         print("Nothing left to upload.")
         return False
+    for e in todo:
+        e["interrupted"] = e["status"] == "uploading"
+        e.setdefault("file_id", None)  # every key exists up front, so saving mid-run never sees a dict grow
+        e.setdefault("error", None)
     sess = session()
-    print(f"Uploading {len(todo)} file(s), {human(sum(e['size'] - e.get('sent', 0) for e in todo))} to go. "
-          "Safe to close the lid or press Ctrl+C at any point.\n")
-    for i, e in enumerate(todo, 1):
-        print(f"[{i}/{len(todo)}] {e['remote_dir']}/{e['name']}")
-        try:
-            upload_file(sess, state, e)
-        except UploadError as err:
-            e.update(status="failed", error=str(err))
+    small = [e for e in todo if e["size"] <= SMALL]
+    big = [e for e in todo if e["size"] > SMALL]
+    print(f"Uploading {len(todo)} file(s), {human(sum(e['size'] - e.get('sent', 0) for e in todo))} to go"
+          f"{f', {WORKERS} at a time' if len(small) > 1 else ''}. Safe to close the lid or press Ctrl+C at any point.\n")
+    try:
+        i = upload_many(sess.credentials, state, small, len(todo)) if small else 0
+        for e in big:
+            i += 1
+            print(f"[{i}/{len(todo)}] {e['remote_dir']}/{e['name']}  ({human(e['size'])})")
+            upload_one(sess, state, e)
+            save(state, force=False)
+            line("")
+            report(i, len(todo), e)
+    except Stop as err:
+        print(f"\nStopped: {err}")
+    finally:
         save(state)
-        line({"verified": "  ✓ uploaded and verified",
-              "mismatch": "  ✗ uploaded, but Drive's copy does not match your file. Upload it again by hand.",
-              "missing": "  ✗ file no longer exists on your Mac, skipped",
-              "failed": f"  ✗ failed: {e.get('error')}"}.get(e["status"], f"  {e['status']}"))
-        print()
     return True
 
 

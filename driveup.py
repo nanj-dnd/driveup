@@ -103,6 +103,7 @@ def load():
 
 
 LOCK_STATE = threading.RLock()  # guards writing state.json and creating folders
+LISTED = {}  # Drive folder id -> {name: [files]}, what was already there, fetched once per folder
 _saved_at = 0.0
 
 
@@ -231,6 +232,7 @@ def _folder_id(sess, state, remote):
             else:
                 meta = {"name": part, "mimeType": FOLDER, "parents": [parent]}
                 state["folders"][path] = check(call(sess, "POST", API, params={"fields": "id"}, json=meta))["id"]
+                LISTED[state["folders"][path]] = {}  # brand new, so nothing to compare against
             save(state, force=False)
         parent = state["folders"][path]
     return parent
@@ -287,6 +289,30 @@ def find_copy(sess, parent, name, digest):
     return next((f for f in found if f.get("md5Checksum") == digest), None)
 
 
+def already_there(sess, state, e, path):
+    """An identical file already in the Drive folder, from an earlier run driveup no longer
+    remembers. One listing per folder; local checksums only for same-name, same-size files."""
+    parent = folder_id(sess, state, e["remote_dir"])
+    with LOCK_STATE:
+        if parent not in LISTED:
+            listing, token = {}, None
+            while True:
+                params = {"q": f"'{parent}' in parents and trashed = false", "pageSize": 1000,
+                          "fields": "nextPageToken,files(id,name,size,md5Checksum)"}
+                if token:
+                    params["pageToken"] = token
+                page = check(call(sess, "GET", API, params=params))
+                for f in page.get("files", []):
+                    listing.setdefault(f["name"], []).append(f)
+                if not (token := page.get("nextPageToken")):
+                    break
+            LISTED[parent] = listing
+        same = [f for f in LISTED[parent].get(e["name"], []) if int(f.get("size", -1)) == e["size"]]
+    if same:
+        digest = md5(path)
+        return next((f for f in same if f.get("md5Checksum") == digest), None)
+
+
 def one_shot(sess, state, e, path):
     """Small files: metadata and bytes in a single request, checked against the bytes sent."""
     data = path.read_bytes()
@@ -334,6 +360,9 @@ def upload_file(sess, state, e):
         e.update(size=st.st_size, mtime=int(st.st_mtime), session=None, sent=0)
     size = e["size"]
     e["status"] = "uploading"
+    if not e.get("session") and (copy := already_there(sess, state, e, path)):
+        e.update(file_id=copy["id"], sent=size, status="verified", note="already in Drive")
+        return
     if 0 < size <= ONE_SHOT:
         return one_shot(sess, state, e, path)
 
@@ -464,7 +493,7 @@ RESULT = {"verified": "✓", "mismatch": "✗ uploaded, but Drive's copy does no
 
 def report(i, n, e):
     mark = RESULT.get(e["status"], e["status"])
-    why = f"  ({e['error']})" if e["status"] == "failed" else ""
+    why = f"  ({e['error']})" if e["status"] == "failed" else f"  ({e['note']})" if e.get("note") else ""
     print(f"[{i}/{n}] {mark} {e['remote_dir']}/{e['name']}{why}")
 
 
@@ -518,6 +547,7 @@ def upload_all(args):
         e["interrupted"] = e["status"] == "uploading"
         e.setdefault("file_id", None)  # every key exists up front, so saving mid-run never sees a dict grow
         e.setdefault("error", None)
+        e.setdefault("note", None)
     sess = session()
     small = [e for e in todo if e["size"] <= SMALL]
     big = [e for e in todo if e["size"] > SMALL]

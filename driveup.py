@@ -61,8 +61,8 @@ NET_ERRORS = (requests.ConnectionError, requests.Timeout, TransportError)
 # A credentials.json in ~/.driveup overrides this.
 CLIENT_CONFIG = {
     "installed": {
-        "client_id": "",
-        "client_secret": "",
+        "client_id": "407233369004-cb0bbks9vou75csn397ufuomcqrvif58.apps.googleusercontent.com",
+        "client_secret": "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",
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
         "redirect_uris": ["http://localhost"],

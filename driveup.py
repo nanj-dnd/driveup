@@ -536,7 +536,7 @@ def upload_one(sess, state, e):
         e.update(status="failed", error=str(err))
 
 
-def upload_many(creds, state, todo, n):
+def upload_many(creds, state, todo, n, done):
     """Small files, several at a time: most of their time is round trips, not bytes."""
     from google.auth.transport.requests import AuthorizedSession
 
@@ -553,12 +553,10 @@ def upload_many(creds, state, todo, n):
 
     QUIET.set()
     pool = ThreadPoolExecutor(WORKERS)
-    i = 0
     try:
         for f in as_completed([pool.submit(work, e) for e in todo]):
             if e := f.result():
-                i += 1
-                report(i, n, e)
+                done(e)
     except BaseException:
         stop.set()  # let uploads in flight finish (seconds), start no new ones
         pool.shutdown(wait=True, cancel_futures=True)
@@ -566,7 +564,6 @@ def upload_many(creds, state, todo, n):
     finally:
         QUIET.clear()
         pool.shutdown(wait=True)
-    return i
 
 
 def upload_all(args):
@@ -585,18 +582,50 @@ def upload_all(args):
     big = [e for e in todo if e["size"] > SMALL]
     print(f"Uploading {len(todo)} file(s), {human(sum(e['size'] - e.get('sent', 0) for e in todo))} to go"
           f"{f', {WORKERS} at a time' if len(small) > 1 else ''}. Safe to close the lid or press Ctrl+C at any point.\n")
+    n, count, lock = len(todo), [0], threading.Lock()
+
+    def done(e):
+        with lock:
+            count[0] += 1
+            report(count[0], n, e)
+
+    def big_files(s, stop, failed):
+        """Big files, one at a time, alongside the small ones: small files are capped by
+        Google's ~3 new files a second and leave most of the bandwidth unused."""
+        try:
+            for e in big:
+                if stop.is_set():
+                    return
+                if not QUIET.is_set():
+                    print(f"{e['remote_dir']}/{e['name']}  ({human(e['size'])})")
+                upload_one(s, state, e)
+                save(state, force=False)
+                line("")
+                done(e)
+        except BaseException as err:  # e.g. Drive full: hand it to the main thread
+            failed.append(err)
+
+    stop, failed = threading.Event(), []
+    worker = None
     try:
-        i = upload_many(sess.credentials, state, small, len(todo)) if small else 0
-        for e in big:
-            i += 1
-            print(f"[{i}/{len(todo)}] {e['remote_dir']}/{e['name']}  ({human(e['size'])})")
-            upload_one(sess, state, e)
-            save(state, force=False)
-            line("")
-            report(i, len(todo), e)
+        if big:
+            from google.auth.transport.requests import AuthorizedSession
+            worker = threading.Thread(target=big_files, args=(AuthorizedSession(sess.credentials), stop, failed),
+                                      daemon=True)  # Ctrl+C mustn't wait for a multi-GB file; it resumes next run
+            if small:
+                QUIET.set()  # live progress returns once only the big file is left
+            worker.start()
+        if small:
+            upload_many(sess.credentials, state, small, n, done)
+        if worker:
+            while worker.is_alive():
+                worker.join(0.5)
+        if failed:
+            raise failed[0]
     except Stop as err:
         print(f"\nStopped: {err}")
     finally:
+        stop.set()
         save(state)
     return True
 

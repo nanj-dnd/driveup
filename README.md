@@ -31,7 +31,9 @@ driveup schedule ~/Documents --to "Backups" --every daily   # automatic backups 
 driveup schedule --list                   # see them; turn one off with --off <id>
 ```
 
-`free` only touches files whose upload was checked against Drive's checksum, that haven't changed since, and that are still in Drive. They go to the Trash, so you can put them back until you empty it.
+`free` only touches files whose upload was checked against Drive's checksum, that haven't changed since, and that are still in Drive. They go to the Trash of the disk they're on (like Finder), so you can put them back until you empty it, and freeing an external drive doesn't copy anything onto your Mac.
+
+Scheduled backups log to `~/.driveup/logs/`, and if one can't finish (sign-in expired, Drive full, macOS blocking a folder, files that failed) you also get a notification.
 
 The first run opens your browser once to sign in to Google. If it's interrupted (Ctrl-C, sleep, wifi, reboot), run `driveup run` and it continues from the last piece Drive received.
 

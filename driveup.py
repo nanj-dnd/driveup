@@ -143,6 +143,15 @@ def line(text):
     sys.stdout.flush()
 
 
+def alert(message):
+    """Scheduled backups run where nobody sees the log, so their failures also show as a
+    macOS notification. Does nothing for runs started by hand."""
+    if os.environ.get("DRIVEUP_SCHEDULED") and sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", "on run argv", "-e",
+                        'display notification (item 1 of argv) with title "driveup backup didn\'t finish"',
+                        "-e", "end run", message], capture_output=True)
+
+
 def eta(seconds):
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -171,6 +180,7 @@ def session():
                 time.sleep(10)
     if not creds or not creds.valid:
         if os.environ.get("DRIVEUP_SCHEDULED"):
+            alert("Google sign-in expired. Run: driveup login")
             sys.exit("Google sign-in expired, so this scheduled backup can't run. Run: driveup login")
         from google_auth_oauthlib.flow import InstalledAppFlow
         if CLIENT.exists():
@@ -511,10 +521,12 @@ def cmd_run(args):
         # Keep the Mac from idle-sleeping while this runs (closing the lid still sleeps it).
         caffeinate = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
         try:
-            if not upload_all(args):
+            if not (todo := upload_all(args)):
                 return
         finally:
             caffeinate.terminate()
+    if bad := [e for e in todo if e["status"] in ("failed", "mismatch")]:
+        alert(f"{len(bad)} file(s) didn't upload. See: driveup status")
     print()
     cmd_status(args)
 
@@ -624,10 +636,11 @@ def upload_all(args):
             raise failed[0]
     except Stop as err:
         print(f"\nStopped: {err}")
+        alert(str(err))
     finally:
         stop.set()
         save(state)
-    return True
+    return todo
 
 
 def cmd_status(args):
@@ -764,14 +777,46 @@ def cmd_check(args):
     print("(driveup can only see files it uploaded itself, so files you put in Drive another way count as missing.)")
 
 
-def trash(path):
-    """Move to the macOS Trash (not a permanent delete), keeping the name unique there."""
-    bin_ = Path.home() / ".Trash"
-    dest, n = bin_ / path.name, 1
-    while dest.exists():
-        dest = bin_ / f"{path.stem} ({n}){path.suffix}"
-        n += 1
-    shutil.move(str(path), dest)
+# NSFileManager's trashItem, what Finder uses: each file goes to the Trash on its own disk.
+TRASH_JS = """
+ObjC.import("Foundation");
+function run(argv) {
+  const fm = $.NSFileManager.defaultManager;
+  return JSON.stringify(argv.map(p => {
+    const err = $();
+    return fm.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(p), $(), err)
+      ? null : ObjC.unwrap(err.localizedDescription);
+  }));
+}"""
+
+
+def trash_many(paths):
+    """Move files to the Trash (not a permanent delete). Returns {path: error} for any that failed.
+    On a Mac each file goes to the Trash of the disk it's on, so freeing an external drive
+    doesn't copy everything onto the Mac's own disk on the way."""
+    errors = {}
+    if sys.platform != "darwin":
+        bin_ = Path.home() / ".local" / "share" / "Trash" / "files"
+        bin_.mkdir(parents=True, exist_ok=True)
+        for p in map(Path, paths):
+            dest, n = bin_ / p.name, 1
+            while dest.exists():
+                dest = bin_ / f"{p.stem} ({n}){p.suffix}"
+                n += 1
+            try:
+                shutil.move(str(p), dest)
+            except OSError as err:
+                errors[str(p)] = str(err)
+        return errors
+    for i in range(0, len(paths), 500):  # stay well under the command-line length limit
+        batch = paths[i:i + 500]
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", TRASH_JS, *batch], capture_output=True, text=True)
+        try:
+            results = json.loads(r.stdout)
+        except ValueError:
+            results = [r.stderr.strip() or "couldn't reach the Trash"] * len(batch)
+        errors.update({p: err for p, err in zip(batch, results) if err})
+    return errors
 
 
 def cmd_free(args):
@@ -811,16 +856,16 @@ def cmd_free(args):
         answer = input("Move them to the Trash on this Mac? You can still put them back until you empty it. [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             return print("Nothing moved.")
-    moved = 0
+    moved, freed, errors = 0, 0, trash_many([e["local"] for e in safe])
     for e in safe:
-        try:
-            trash(Path(e["local"]))
+        if err := errors.get(e["local"]):
+            print(f"  couldn't move {e['local']}: {err}")
+        else:
             e["note"] = "moved to Trash on this Mac"
             moved += 1
-        except OSError as err:
-            print(f"  couldn't move {e['local']}: {err}")
+            freed += e["size"]
     save(state)
-    print(f"Moved {moved} file(s), {human(sum(e['size'] for e in safe if e.get('note')))}, to the Trash. "
+    print(f"Moved {moved} file(s), {human(freed)}, to the Trash. "
           "Empty the Trash to get the space back.")
 
 
@@ -970,6 +1015,13 @@ def main():
          "check": cmd_check, "free": cmd_free, "link": cmd_link, "schedule": cmd_schedule}[args.cmd](args)
     except KeyboardInterrupt:
         print("\n\nPaused. Progress is saved. Continue anytime with: driveup run")
+    except PermissionError as err:  # in a scheduled run: macOS guarding Desktop, Documents or Downloads
+        alert(f"macOS blocked {err.filename or 'a folder'}. Give driveup Full Disk Access in "
+              "System Settings > Privacy & Security.")
+        raise
+    except Exception as err:
+        alert(f"{type(err).__name__}: {err}")
+        raise
 
 
 if __name__ == "__main__":

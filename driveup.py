@@ -17,7 +17,9 @@ import hashlib
 import json
 import mimetypes
 import os
+import plistlib
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -168,6 +170,8 @@ def session():
                 line("No internet connection, retrying in 10s")
                 time.sleep(10)
     if not creds or not creds.valid:
+        if os.environ.get("DRIVEUP_SCHEDULED"):
+            sys.exit("Google sign-in expired, so this scheduled backup can't run. Run: driveup login")
         from google_auth_oauthlib.flow import InstalledAppFlow
         if CLIENT.exists():
             flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT), SCOPES)
@@ -289,13 +293,11 @@ def find_copy(sess, parent, name, digest):
     return next((f for f in found if f.get("md5Checksum") == digest), None)
 
 
-def already_there(sess, state, e, path):
-    """An identical file already in the Drive folder, from an earlier run driveup no longer
-    remembers. One listing per folder; local checksums only for same-name, same-size files."""
-    parent = folder_id(sess, state, e["remote_dir"])
+def listing(sess, parent):
+    """What's in a Drive folder (that driveup can see), as {name: [files]}. Fetched once per run."""
     with LOCK_STATE:
         if parent not in LISTED:
-            listing, token = {}, None
+            found, token = {}, None
             while True:
                 params = {"q": f"'{parent}' in parents and trashed = false", "pageSize": 1000,
                           "fields": "nextPageToken,files(id,name,size,md5Checksum)"}
@@ -303,11 +305,35 @@ def already_there(sess, state, e, path):
                     params["pageToken"] = token
                 page = check(call(sess, "GET", API, params=params))
                 for f in page.get("files", []):
-                    listing.setdefault(f["name"], []).append(f)
+                    found.setdefault(f["name"], []).append(f)
                 if not (token := page.get("nextPageToken")):
                     break
-            LISTED[parent] = listing
-        same = [f for f in LISTED[parent].get(e["name"], []) if int(f.get("size", -1)) == e["size"]]
+            LISTED[parent] = found
+        return LISTED[parent]
+
+
+def lookup_folder(sess, state, remote):
+    """Like folder_id, but only finds: returns None instead of creating anything."""
+    remote = remote.strip("/")
+    if not remote:
+        return "root"
+    if remote in state["folders"]:
+        return state["folders"][remote]
+    parent = "root"
+    for part in remote.split("/"):
+        q = f"name = '{esc(part)}' and mimeType = '{FOLDER}' and '{parent}' in parents and trashed = false"
+        found = check(call(sess, "GET", API, params={"q": q, "fields": "files(id)"}))["files"]
+        if not found:
+            return None
+        parent = found[0]["id"]
+    return parent
+
+
+def already_there(sess, state, e, path):
+    """An identical file already in the Drive folder, from an earlier run driveup no longer
+    remembers. One listing per folder; local checksums only for same-name, same-size files."""
+    parent = folder_id(sess, state, e["remote_dir"])
+    same = [f for f in listing(sess, parent).get(e["name"], []) if int(f.get("size", -1)) == e["size"]]
     if same:
         digest = md5(path)
         return next((f for f in same if f.get("md5Checksum") == digest), None)
@@ -432,41 +458,47 @@ def upload_file(sess, state, e):
 
 # ---------- commands ----------
 
+def walk(paths, remote_root):
+    """Each local file under paths, with the Drive folder it belongs in."""
+    for raw in paths:
+        p = Path(raw).expanduser().resolve()
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file() and f.name not in SKIP:
+                    yield f, "/".join(filter(None, [remote_root, p.name, *f.relative_to(p).parent.parts]))
+        elif p.is_file():
+            yield p, remote_root
+        else:
+            print(f"Not found, skipping: {raw}")
+
+
 def cmd_add(args):
     state = load()
     queued, skipped, total = 0, 0, 0
     remote_root = args.to.strip("/")
-    for raw in args.paths:
-        p = Path(raw).expanduser().resolve()
-        if p.is_dir():
-            items = [(f, "/".join(filter(None, [remote_root, p.name, *f.relative_to(p).parent.parts])))
-                     for f in sorted(p.rglob("*")) if f.is_file() and f.name not in SKIP]
-        elif p.is_file():
-            items = [(p, remote_root)]
-        else:
-            print(f"Not found, skipping: {raw}")
+    for f, remote_dir in walk(args.paths, remote_root):
+        st = f.stat()
+        key = f"{remote_dir}\x00{f}"
+        old = state["files"].get(key)
+        if old and old["status"] in FINISHED and (old["size"], old["mtime"]) == (st.st_size, int(st.st_mtime)):
+            skipped += 1
             continue
-        for f, remote_dir in items:
-            st = f.stat()
-            key = f"{remote_dir}\x00{f}"
-            old = state["files"].get(key)
-            if old and old["status"] in FINISHED and (old["size"], old["mtime"]) == (st.st_size, int(st.st_mtime)):
-                skipped += 1
-                continue
-            if old and (old["size"], old["mtime"]) == (st.st_size, int(st.st_mtime)):
-                old["status"] = "pending" if old["status"] != "uploading" else old["status"]
-            else:
-                state["files"][key] = {"local": str(f), "name": f.name, "remote_dir": remote_dir,
-                                       "size": st.st_size, "mtime": int(st.st_mtime),
-                                       "status": "pending", "sent": 0, "session": None, "queued": time.time()}
-            queued += 1
-            total += st.st_size
+        if old and (old["size"], old["mtime"]) == (st.st_size, int(st.st_mtime)):
+            old["status"] = "pending" if old["status"] != "uploading" else old["status"]
+        else:
+            state["files"][key] = {"local": str(f), "name": f.name, "remote_dir": remote_dir,
+                                   "size": st.st_size, "mtime": int(st.st_mtime),
+                                   "status": "pending", "sent": 0, "session": None, "queued": time.time()}
+        queued += 1
+        total += st.st_size
     save(state)
     print(f"Queued {queued} file(s), {human(total)}, into Drive folder \"{remote_root or 'My Drive'}\".")
     if skipped:
         print(f"Skipped {skipped} already uploaded and unchanged.")
     if queued and not args.no_start:
         cmd_run(args)
+        if not os.environ.get("DRIVEUP_SCHEDULED"):
+            print(f'\nShare it with someone: driveup link "{remote_root or args.paths[0]}"')
 
 
 def cmd_run(args):
@@ -665,6 +697,208 @@ def cmd_pick(args):
     cmd_add(args)
 
 
+def under(path, roots):
+    return not roots or any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def cmd_check(args):
+    """Compare local files with Drive without uploading: proof before you delete or wipe anything."""
+    state, sess = load(), session()
+    remote_root = args.to.strip("/")
+    same, missing, different = 0, [], []
+    for i, (f, remote_dir) in enumerate(walk(args.paths, remote_root), 1):
+        if i % 25 == 0:
+            line(f"  checked {i} file(s)...")
+        parent = lookup_folder(sess, state, remote_dir)
+        there = listing(sess, parent).get(f.name, []) if parent else []
+        size = f.stat().st_size
+        sized = [x for x in there if int(x.get("size", -1)) == size]
+        where = f"{remote_dir}/{f.name}"
+        if not there:
+            missing.append(where)
+        elif sized and md5(f) in {x.get("md5Checksum") for x in sized}:
+            same += 1
+        else:
+            different.append(where)
+    line("")
+    print(f"✓ {same} file(s) are in Drive and match your copy exactly.")
+    for label, items in (("✗ not in Drive", missing), ("≠ in Drive but different from your copy", different)):
+        if items:
+            print(f"{label}: {len(items)}")
+            for w in items[:50]:
+                print(f"    {w}")
+            if len(items) > 50:
+                print(f"    ... and {len(items) - 50} more")
+    if missing or different:
+        print("\nUpload them with: driveup add " + " ".join(f'"{p}"' for p in args.paths)
+              + (f' --to "{remote_root}"' if remote_root != "driveup" else ""))
+    print("(driveup can only see files it uploaded itself, so files you put in Drive another way count as missing.)")
+
+
+def trash(path):
+    """Move to the macOS Trash (not a permanent delete), keeping the name unique there."""
+    bin_ = Path.home() / ".Trash"
+    dest, n = bin_ / path.name, 1
+    while dest.exists():
+        dest = bin_ / f"{path.stem} ({n}){path.suffix}"
+        n += 1
+    shutil.move(str(path), dest)
+
+
+def cmd_free(args):
+    """Free up space: move local files to the Trash, but only ones Drive has confirmed."""
+    state = load()
+    roots = [str(Path(p).expanduser().resolve()) for p in args.paths]
+    picked = {}
+    for e in state["files"].values():
+        if e["status"] != "verified" or not e.get("file_id") or not under(e["local"], roots):
+            continue
+        try:
+            st = os.stat(e["local"])
+        except FileNotFoundError:
+            continue
+        if (st.st_size, int(st.st_mtime)) == (e["size"], e["mtime"]):  # unchanged since the checked upload
+            picked.setdefault(e["local"], e)
+    if not picked:
+        sys.exit("Nothing to free: no uploaded-and-verified files are still on this Mac"
+                 + (" under those folders." if roots else "."))
+    # Make sure each copy is still in Drive (not deleted or trashed since), one listing per folder.
+    sess = session()
+    print("Confirming each file is still in Drive...")
+    safe = []
+    for e in picked.values():
+        parent = state["folders"].get(e["remote_dir"]) or lookup_folder(sess, state, e["remote_dir"])
+        ids = {x["id"] for x in listing(sess, parent).get(e["name"], [])} if parent else set()
+        if e["file_id"] in ids:
+            safe.append(e)
+    gone = len(picked) - len(safe)
+    if gone:
+        print(f"Keeping {gone} file(s) on your Mac: their Drive copy is gone or in Drive's trash.")
+    if not safe:
+        return
+    total = sum(e["size"] for e in safe)
+    print(f"{len(safe)} file(s), {human(total)}, are safely in Drive and match your copies.")
+    if not args.yes:
+        answer = input("Move them to the Trash on this Mac? You can still put them back until you empty it. [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            return print("Nothing moved.")
+    moved = 0
+    for e in safe:
+        try:
+            trash(Path(e["local"]))
+            e["note"] = "moved to Trash on this Mac"
+            moved += 1
+        except OSError as err:
+            print(f"  couldn't move {e['local']}: {err}")
+    save(state)
+    print(f"Moved {moved} file(s), {human(sum(e['size'] for e in safe if e.get('note')))}, to the Trash. "
+          "Empty the Trash to get the space back.")
+
+
+def drive_target(sess, state, target):
+    """A Drive file or folder id for a local path driveup uploaded, or a Drive folder path."""
+    p = Path(target).expanduser()
+    if p.exists():
+        p = str(p.resolve())
+        if os.path.isfile(p):
+            hit = next((e for e in state["files"].values() if e["local"] == p and e.get("file_id")), None)
+            return hit and hit["file_id"]
+        for e in state["files"].values():
+            if e["local"].startswith(p + "/"):
+                depth = len(Path(e["local"]).parent.relative_to(p).parts)
+                parts = e["remote_dir"].split("/")
+                remote = "/".join(parts[:len(parts) - depth])
+                return state["folders"].get(remote) or lookup_folder(sess, state, remote)
+        return None
+    return lookup_folder(sess, state, target)
+
+
+def cmd_link(args):
+    state, sess = load(), session()
+    fid = drive_target(sess, state, args.target)
+    if not fid or fid == "root":
+        sys.exit(f"driveup hasn't uploaded \"{args.target}\". Give a file or folder it uploaded, "
+                 'or a Drive folder path like "Backups/Movies".')
+    check(call(sess, "POST", f"{API}/{fid}/permissions", json={"role": "reader", "type": "anyone"}))
+    url = check(call(sess, "GET", f"{API}/{fid}", params={"fields": "webViewLink"}))["webViewLink"]
+    print(url)
+    if shutil.which("pbcopy"):
+        subprocess.run(["pbcopy"], input=url, text=True)
+        print("Copied. Anyone with this link can view (not edit). Stop sharing from Drive's Share button.")
+
+
+# ---------- scheduled backups (macOS launchd) ----------
+
+AGENTS = Path.home() / "Library" / "LaunchAgents"
+
+
+def agent_label(paths, to):
+    return "com.driveup." + hashlib.sha1("\0".join([to, *paths]).encode()).hexdigest()[:8]
+
+
+def launchctl(*a):
+    return subprocess.run(["launchctl", *a], capture_output=True, text=True)
+
+
+def cmd_schedule(args):
+    if sys.platform != "darwin":
+        sys.exit("Scheduled backups use macOS launchd. On Linux, add `driveup add ...` to cron instead.")
+    domain = f"gui/{os.getuid()}"
+    agents = sorted(AGENTS.glob("com.driveup.*.plist"))
+    if args.list or (not args.paths and not args.off):
+        if not agents:
+            return print('No scheduled backups. Add one with: driveup schedule ~/Documents --to "Backups"')
+        for a in agents:
+            job = plistlib.loads(a.read_bytes())
+            cmd = job["ProgramArguments"]
+            when = "hourly" if "StartInterval" in job else "daily at 2:00"
+            print(f"{job['Label'][12:]}  {when}  {' '.join(cmd[2:])}")
+        return print("\nTurn one off with: driveup schedule --off <id>   (or --off all)")
+    if args.off:
+        hits = agents if args.off == "all" else [a for a in agents if a.stem.endswith(args.off)]
+        if not hits:
+            sys.exit(f"No scheduled backup called {args.off}. See them with: driveup schedule --list")
+        for a in hits:
+            launchctl("bootout", f"{domain}/{a.stem}")
+            a.unlink()
+            print(f"Turned off {a.stem[12:]}.")
+        return
+    paths = [str(Path(p).expanduser().resolve()) for p in args.paths]
+    for p in paths:
+        if not os.path.exists(p):
+            sys.exit(f"Not found: {p}")
+    to = args.to.strip("/")
+    label = agent_label(paths, to)
+    exe = Path(sys.argv[0]).resolve()
+    program = [str(exe)] if os.access(exe, os.X_OK) and exe.suffix != ".py" else [sys.executable, str(Path(__file__).resolve())]
+    logs = HOME / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    job = {
+        "Label": label,
+        "ProgramArguments": [*program, "add", *paths, "--to", to],
+        "EnvironmentVariables": {"DRIVEUP_SCHEDULED": "1", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        "StandardOutPath": str(logs / f"{label[12:]}.log"),
+        "StandardErrorPath": str(logs / f"{label[12:]}.log"),
+        "ProcessType": "Background",
+        **({"StartInterval": 3600} if args.every == "hourly" else {"StartCalendarInterval": {"Hour": 2, "Minute": 0}}),
+    }
+    AGENTS.mkdir(parents=True, exist_ok=True)
+    plist = AGENTS / f"{label}.plist"
+    launchctl("bootout", f"{domain}/{label}")  # replace an existing schedule for the same folders
+    plist.write_bytes(plistlib.dumps(job))
+    r = launchctl("bootstrap", domain, str(plist))
+    if r.returncode:
+        plist.unlink()
+        sys.exit(f"macOS didn't accept the schedule: {r.stderr.strip()}")
+    when = "every hour" if args.every == "hourly" else "every day at 2:00 (or when your Mac next wakes)"
+    print(f"Scheduled ({label[12:]}): {when}, new and changed files go to Drive folder \"{to or 'My Drive'}\".")
+    print(f"Log: {job['StandardOutPath']}")
+    private = [p for p in paths if any(p.startswith(str(Path.home() / d)) for d in ("Desktop", "Documents", "Downloads"))]
+    if private:
+        print("\nmacOS guards Desktop, Documents and Downloads from background jobs. If the log says "
+              f"'Operation not permitted', open System Settings > Privacy & Security > Full Disk Access and add:\n  {program[0]}")
+
+
 def cmd_login(args):
     session()
     print("Signed in. driveup can upload now.")
@@ -685,11 +919,26 @@ def main():
     sub.add_parser("status", help="show what's uploaded").add_argument("--all", action="store_true", help="list finished files too")
     sub.add_parser("clear", help="forget finished uploads")
     sub.add_parser("login", help="sign in to Google")
+    c = sub.add_parser("check", help="compare local files with Drive, without uploading")
+    c.add_argument("paths", nargs="+")
+    c.add_argument("--to", default="driveup", help="Drive folder they were uploaded to (default: driveup)")
+    f = sub.add_parser("free", help="move files already safe in Drive to the Trash on this Mac")
+    f.add_argument("paths", nargs="*", help="only files under these folders (default: everything uploaded)")
+    f.add_argument("--yes", action="store_true", help="don't ask first")
+    sub.add_parser("link", help="get a view-only share link for something uploaded").add_argument(
+        "target", help='a file or folder driveup uploaded, or a Drive folder path like "Backups/Movies"')
+    sc = sub.add_parser("schedule", help="back up folders automatically (daily or hourly)")
+    sc.add_argument("paths", nargs="*")
+    sc.add_argument("--to", default="driveup", help="Drive folder (default: driveup)")
+    sc.add_argument("--every", choices=["daily", "hourly"], default="daily")
+    sc.add_argument("--list", action="store_true", help="show scheduled backups")
+    sc.add_argument("--off", metavar="ID", help="turn off a scheduled backup (or 'all')")
     args = ap.parse_args()
     if not args.cmd:  # plain `driveup` opens the file picker
         args = ap.parse_args(["pick"])
     try:
-        {"pick": cmd_pick, "add": cmd_add, "run": cmd_run, "status": cmd_status, "clear": cmd_clear, "login": cmd_login}[args.cmd](args)
+        {"pick": cmd_pick, "add": cmd_add, "run": cmd_run, "status": cmd_status, "clear": cmd_clear, "login": cmd_login,
+         "check": cmd_check, "free": cmd_free, "link": cmd_link, "schedule": cmd_schedule}[args.cmd](args)
     except KeyboardInterrupt:
         print("\n\nPaused. Progress is saved. Continue anytime with: driveup run")
 

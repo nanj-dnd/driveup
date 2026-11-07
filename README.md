@@ -21,6 +21,18 @@ driveup run                                             # continue anything unfi
 driveup clear                                           # forget finished uploads
 ```
 
+### More tools
+
+```sh
+driveup check ~/Photos --to "Backups"     # compare with Drive, upload nothing: what's missing or different
+driveup free ~/Photos                     # move files Drive has confirmed to the Trash, to free up space
+driveup link ~/Photos/Trip                # view-only share link for an uploaded file or folder (copied)
+driveup schedule ~/Documents --to "Backups" --every daily   # automatic backups of new and changed files
+driveup schedule --list                   # see them; turn one off with --off <id>
+```
+
+`free` only touches files whose upload was checked against Drive's checksum, that haven't changed since, and that are still in Drive. They go to the Trash, so you can put them back until you empty it.
+
 The first run opens your browser once to sign in to Google. If it's interrupted (Ctrl-C, sleep, wifi, reboot), run `driveup run` and it continues from the last piece Drive received.
 
 Driveup only asks for the `drive.file` scope, so it can see the files it uploaded and nothing else in your Drive. Files go straight from your computer to Google.

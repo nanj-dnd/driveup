@@ -25,8 +25,15 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# macOS's own Python (what `xcode-select --install` gives you) is 3.9 built against LibreSSL.
+# urllib3 and google-auth each print a warning about that on every import; neither is something
+# a driveup user can act on, and uploads work fine, so keep them off the screen.
+warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL")
+warnings.filterwarnings("ignore", message=r"You are using a Python version .* past its end of life", category=FutureWarning)
 
 import requests
 from google.auth.exceptions import RefreshError, TransportError

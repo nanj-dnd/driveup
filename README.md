@@ -8,7 +8,7 @@ Upload big files to Google Drive from the terminal without babysitting them. Upl
 curl -fsSL https://raw.githubusercontent.com/nanj-dnd/driveup/main/install.sh | sh
 ```
 
-Needs Python 3 (on a Mac: `xcode-select --install`). Or with pipx: `pipx install git+https://github.com/nanj-dnd/driveup.git`.
+Needs Python 3 (on a Mac: `xcode-select --install`, or `brew install python`; the installer picks the newest Python it finds). Or with pipx: `pipx install git+https://github.com/nanj-dnd/driveup.git`.
 
 ## Use
 
@@ -38,3 +38,7 @@ Scheduled backups log to `~/.driveup/logs/`, and if one can't finish (sign-in ex
 The first run opens your browser once to sign in to Google. If it's interrupted (Ctrl-C, sleep, wifi, reboot), run `driveup run` and it continues from the last piece Drive received.
 
 Driveup only asks for the `drive.file` scope, so it can see the files it uploaded and nothing else in your Drive. Files go straight from your computer to Google.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

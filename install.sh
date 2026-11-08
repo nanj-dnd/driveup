@@ -6,13 +6,18 @@ set -e
 app="$HOME/.driveup/app"
 bin="$HOME/.local/bin"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "driveup needs Python 3. On a Mac, run: xcode-select --install" >&2
+# Prefer a current Python (e.g. Homebrew's) over macOS's built-in 3.9 when one is installed.
+py=""
+for v in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+  if command -v "$v" >/dev/null 2>&1; then py="$v"; break; fi
+done
+if [ -z "$py" ]; then
+  echo "driveup needs Python 3. On a Mac, run: xcode-select --install (or: brew install python)" >&2
   exit 1
 fi
 
 echo "Installing driveup..."
-python3 -m venv "$app"
+"$py" -m venv "$app"
 "$app/bin/pip" install --quiet --upgrade pip
 "$app/bin/pip" install --quiet --upgrade "git+https://github.com/nanj-dnd/driveup.git"
 mkdir -p "$bin"

@@ -732,6 +732,56 @@ return out
 """
 
 
+TOP = "My Drive (top level)"
+NEW = "New folder…"
+
+# Pick a Drive folder from a Mac list. Folder names come in as arguments, so no quoting issues.
+DEST_PICKER = """
+on run argv
+  set previous to item 1 of argv
+  set choices to rest of argv
+  set picked to choose from list choices with title "driveup" with prompt "Upload to which Google Drive folder?" ¬
+    default items {previous} OK button name "Upload here"
+  if picked is false then return ""
+  set picked to item 1 of picked
+  if picked is "New folder…" then
+    set answer to text returned of (display dialog "New folder name (use / for a folder inside another, like Backups/2026):" ¬
+      default answer "" with title "driveup")
+    return "new:" & answer
+  end if
+  return picked
+end run
+"""
+
+
+def drive_folders(sess, state):
+    """Drive folders driveup can offer: ones it made (2 levels deep, to keep the list short),
+    plus top-level ones it made from another computer."""
+    paths = {p for p in state["folders"] if p.count("/") < 2}
+    try:
+        q = f"'root' in parents and mimeType = '{FOLDER}' and trashed = false"
+        paths |= {f["name"] for f in check(call(sess, "GET", API, params={"q": q, "fields": "files(name)", "pageSize": 1000}))["files"]}
+    except UploadError:
+        pass
+    return sorted(paths, key=str.lower)
+
+
+def choose_destination(state):
+    """Ask where in Drive to upload. Returns a Drive folder path ("" = top of My Drive)."""
+    folders = drive_folders(session(), state)
+    last = state.get("last_to")
+    last = TOP if last == "" else last if last in folders else (folders[0] if folders else TOP)
+    out = subprocess.run(["osascript", "-e", DEST_PICKER, last, TOP, *folders, NEW], capture_output=True, text=True)
+    picked = out.stdout.strip()
+    if not picked:
+        sys.exit("Nothing uploaded (no Drive folder chosen).")
+    if picked.startswith("new:"):
+        picked = "/".join(p.strip() for p in picked[4:].split("/") if p.strip())
+        if not picked:
+            sys.exit("Nothing uploaded (the new folder needs a name).")
+    return "" if picked == TOP else picked
+
+
 def cmd_pick(args):
     if sys.platform != "darwin":
         sys.exit('Picking files needs a Mac. Instead run: driveup add <file or folder> --to "Folder"')
@@ -742,6 +792,12 @@ def cmd_pick(args):
     args.paths = [p for p in out.stdout.splitlines() if p]
     if not args.paths:
         sys.exit("Nothing chosen.")
+    state = load()
+    if args.to is None:
+        args.to = choose_destination(state)
+    state = load()
+    state["last_to"] = args.to.strip("/")
+    save(state)
     args.no_start = False
     cmd_add(args)
 
@@ -989,7 +1045,7 @@ def main():
     ap = argparse.ArgumentParser(prog="driveup", description="Resumable Google Drive uploads.")
     sub = ap.add_subparsers(dest="cmd")
     k = sub.add_parser("pick", help="choose files/folders in a window and upload them (same as plain `driveup`)")
-    k.add_argument("--to", default="driveup", help='Drive folder path (default: driveup)')
+    k.add_argument("--to", help="Drive folder path (default: choose from a list)")
     k.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
     a = sub.add_parser("add", help="queue files/folders and start uploading")
     a.add_argument("paths", nargs="+")
